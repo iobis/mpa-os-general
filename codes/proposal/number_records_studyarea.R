@@ -136,7 +136,7 @@ wlt <- theme_classic()+
         
   )
 
-ggplot() +
+p1 <- ggplot() +
   geom_sf(data = europe_h3_shp, aes(fill = records, color = after_scale(fill)), linewidth = 0.1) +
 #   sca(limits = NULL, guide_title = "log10(Number of records)",
 #       trans = "log10",
@@ -148,7 +148,51 @@ ggplot() +
   #scale_fill_viridis_c(option = "plasma", trans = "log") +
   coord_sf(crs = "EPSG:3035")
 
+p1
+
 ggsave(file.path(outfolder, "number_records.jpg"),
        width = 20, height = 18, units = "cm", quality = 100)
 
 
+# Records
+bath <- terra::rast("~/Research/mpa_europe/mpaeu_sdm/data/env/terrain/bathymetry_mean.tif")
+
+depths <- terra::extract(bath, st_centroid(europe_h3_shp), ID = F)
+
+depths_df <- data.frame(depth = depths[,1], records = europe_h3_shp$records)
+
+depths_df$bin_depth <- cut(depths_df$depth, 100)
+
+depths_df <- depths_df %>%
+  group_by(bin_depth) %>%
+  summarise(avg_records = mean(records, na.rm = T),
+            min_records = min(records, na.rm = T),
+            max_records = max(records, na.rm = T),
+            depth = mean(depth, na.rm = T))
+
+p2 <- ggplot(depths_df) + 
+  geom_line(aes(x = depth, y = avg_records), linewidth = 1, color = "#009594") +
+  geom_ribbon(aes(ymin = min_records, ymax = max_records, x = depth), alpha = 0.1, fill = "#009594") +
+  scale_y_log10(labels = scales::label_comma()) +
+  theme_light() +
+  xlab("Depth") + ylab("Number of records") + 
+  ggtitle("Average number of records by depth", "Shaded area shows minimum and maximum \nnumber of records. Note that y axis is \nlog10 adjusted.") +
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_text(colour = "grey60", size = 8),
+        axis.text = element_text(colour = "grey60", size = 6),
+        plot.subtitle = element_text(colour = "grey60", size = 8)
+        )
+
+layout <- "
+AAABB
+AAABB
+AAA##
+"
+
+(p1 + theme(legend.position = "none") + ggtitle("Number of records in OBIS/GBIF")) + p2 + plot_layout(design = layout)
+
+#(p1 + theme(legend.position = "none")) + p2 + plot_layout(widths = c(2, 1))
+
+ggsave(file.path(outfolder, "number_records_sideplot.jpg"),
+       width = 24, height = 14, units = "cm", quality = 100)
