@@ -1,0 +1,260 @@
+# Plot records over Europe
+
+library(h3jsr)
+library(sf)
+library(terra)
+library(ggplot2)
+library(dplyr)
+library(DBI)
+library(duckdb)
+library(ggplot2)
+library(patchwork)
+sf::sf_use_s2(FALSE)
+outfolder <- "figures"
+fs::dir_create(outfolder)
+
+iho <- st_read("~/Research/mpa_europe/mpaeu_sandbox/data/Intersect_EEZ_IHO_v4_2020/Intersect_EEZ_IHO_v4_2020.shp")
+europe <- st_read("~/Research/mpa_europe/mpaeu_sdm/data/shapefiles/mpa_europe_starea_v2.shp")
+
+europe_bbox <- st_bbox(europe)
+europe_bbox[1] <- -100
+europe_bbox <- st_as_sfc(europe_bbox)
+
+to_cut <- iho$MARREGION[grepl("Canadian|United States|Mexico|Bahamas|Bermu|Turks and C|Dominican|Saint-Pierre", iho$MARREGION)]
+iho_sel <- iho[iho$MARREGION %in% to_cut,]
+
+wrld <- rnaturalearth::ne_countries(scale = 50, returnclass = "sf", continent = "North America")
+
+europe_bbox <- st_intersection(europe_bbox, st_make_grid(europe_bbox, n = c(4,4)))
+
+records <- list()
+
+# Do in batches
+for (i in 1:16) {
+    cat("Processing", i, "\n")
+    europe_h3 <- polygon_to_cells(europe_bbox[i,], res = 7)
+    europe_h3 <- unlist(europe_h3)
+    cells <- data.frame(cell = europe_h3)
+
+    # Set up duckdb connection and register cells table
+    con <- dbConnect(duckdb())
+    dbSendQuery(con, "install httpfs; load httpfs;")
+    duckdb_register(con, "cells", cells)
+
+    # Join cells list and gridded species dataset
+    # Use this one to load from the S3 bucket
+#     species <- dbGetQuery(con, "
+#   select *
+#   from cells
+#   inner join read_parquet('s3://obis-products/speciesgrids/h3_7/*') h3 on cells.cell = h3.h3_07
+# ")
+    species <- dbGetQuery(con, "
+      select *
+      from cells
+      inner join read_parquet('../../mpa_europe/mpaeu_shared/grided/h3_7/*') h3 on cells.cell = h3.h3_07
+    ")
+
+    species$h3_5 <- h3jsr::get_parent(species$h3_07, res = 5)
+
+    records[[i]] <- species
+
+    dbDisconnect(con)
+}
+
+records <- bind_rows(records)
+
+# Because we run in batches, just check if there are no duplicated cells
+records_undup <- records %>%
+    group_by(species) %>%
+    distinct(cell, .keep_all = T)
+
+# Remove those in the iho part
+iho_sel_h5 <- polygon_to_cells(iho_sel, res = 5)
+
+for (i in 1:length(iho_sel_h5)) {
+  cat("Processing", i, "\n")
+  records_undup <- records_undup %>%
+    filter(!h3_5 %in% unlist(iho_sel_h5[[i]]))
+}
+
+# Remove those in land americas
+wrld_sel_h5 <- polygon_to_cells(st_as_sf(buffer(vect(wrld), 4000)), res = 5)
+
+for (i in 1:length(wrld_sel_h5)) {
+  cat("Processing", i, "\n")
+  records_undup <- records_undup %>%
+    filter(!h3_5 %in% unlist(wrld_sel_h5[[i]]))
+}
+
+europe_h3_shp <- st_as_sf(cell_to_polygon(unique(records_undup$h3_5)))
+
+europe_h3_shp$h3 <- unique(records_undup$h3_5)
+names(europe_h3_shp)[1] <- "geometry"
+st_geometry(europe_h3_shp) <- "geometry"
+
+records_summary <- records_undup %>%
+    group_by(h3_5) %>%
+    summarise(records = sum(records))
+
+europe_h3_shp <- left_join(europe_h3_shp, records_summary %>% rename(h3 = h3_5))
+
+base_map <- rnaturalearth::ne_countries(returnclass = "sf", scale = 50)
+
+sf_use_s2(FALSE)
+base_map <- st_crop(base_map, europe)
+
+to_remove <- st_intersects(europe_h3_shp, base_map, sparse = F)
+to_remove <- apply(to_remove, 1, any)
+
+# Check if onland
+to_remove <- europe_h3_shp[to_remove, "h3"]
+to_remove_crd <- h3jsr::cell_to_point(to_remove$h3)
+to_remove_crd <- st_coordinates(to_remove_crd)
+colnames(to_remove_crd) <- c("decimalLongitude", "decimalLatitude")
+to_remove_checked <- obistools::check_onland(as.data.frame(to_remove_crd), report = T, buffer = 100)
+
+to_remove <- to_remove[to_remove_checked$row,]
+
+europe_h3_shp <- europe_h3_shp %>%
+    filter(!h3 %in% to_remove$h3)
+
+# Fix those still on Americas
+wrld <- st_as_sf(buffer(vect(wrld), 15000))
+
+to_remove <- st_intersects(europe_h3_shp, wrld, sparse = F)
+to_remove <- apply(to_remove, 1, any)
+to_remove <- europe_h3_shp[to_remove, "h3"]
+
+europe_h3_shp <- europe_h3_shp %>%
+    filter(!h3 %in% to_remove$h3)
+
+# Still a problem with one point
+one_rm <- st_as_sfc(st_bbox(ext(-80, -75, 25, 28)))
+st_crs(one_rm) <- "EPSG:4326"
+
+to_remove <- st_intersects(europe_h3_shp, one_rm, sparse = F)
+to_remove <- apply(to_remove, 1, any)
+to_remove <- europe_h3_shp[to_remove, "h3"]
+
+europe_h3_shp <- europe_h3_shp %>%
+    filter(!h3 %in% to_remove$h3)
+
+records_undup_selarea <- records %>%
+    group_by(species) %>%
+    distinct(cell, .keep_all = T) %>%
+    filter(h3_5 %in% europe_h3_shp$h3)
+
+# Get stats ----
+sum(europe_h3_shp$records)
+length(unique(records_undup_selarea$species))
+min(records_undup_selarea$min_year, na.rm = T)
+max(records_undup_selarea$max_year, na.rm = T)
+
+
+# Plot ----
+# Prepare base settings
+sca <- function(limits, guide_title, ...) {
+  scale_fill_gradientn(
+    colours = rev(c("#7d1500", "#da4325", "#eca24e", "#e7e2bc", "#5cc3af", "#0a6265")),
+    limits = limits,
+    guide = guide_colorbar(title = guide_title,
+                           show.limits = TRUE,
+                           barheight = unit(0.12, "in"),
+                           barwidth = unit(3.5, "in"),
+                           ticks = F,
+                           ticks.colour = "grey20",
+                           frame.colour = "grey20",
+                           title.position = "top"),
+    ...#,
+    #labels = c("Low", "", "", "", "High")#,
+    #na.value = "#2b0700"
+  )
+}
+
+wlt <- theme_classic()+
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_text(colour = "grey20", size = 14),
+        axis.title.x.top = element_text(vjust = 2, size = 16),
+        axis.title.y.left = element_text(size = 16),
+        panel.background = element_blank(),
+        #panel.border = element_rect(fill = NA, color = "grey60"),
+        panel.border = element_blank(),
+        panel.grid.major = element_line(linetype = 'dashed', 
+                                        colour = "grey40",
+                                        linewidth = .1),
+        legend.position="bottom",
+        legend.title.align=0.5,
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 11),
+        legend.background = element_rect(fill = "white"),
+        plot.title = element_text(size = 20)
+        
+  )
+
+base_map <- rnaturalearth::ne_countries(returnclass = "sf", scale = 50)
+p1 <- ggplot() +
+  geom_sf(data = st_crop(iho_sel, europe_h3_shp), color = "grey90", fill = "#ededed") +
+  geom_sf(data = europe_h3_shp, aes(fill = records, color = after_scale(fill)), linewidth = 0.1) +
+#   sca(limits = NULL, guide_title = "log10(Number of records)",
+#       trans = "log10",
+#       na.value = "grey60") +
+  scale_fill_viridis_c(limits = NULL, name = "log10(Number of records)",
+      trans = "log10", option = "C") + 
+  geom_sf(data = st_crop(base_map, europe_h3_shp), fill = "white", color = "grey90") +
+  wlt +
+  #scale_fill_viridis_c(option = "plasma", trans = "log") +
+  coord_sf(crs = "EPSG:3035")
+
+p1 <- p1 + ggtitle("Number of records in OBIS/GBIF") + theme(legend.position = "none")
+p1
+
+ggsave(file.path(outfolder, "number_records_ea.jpg"),
+       width = 20, height = 18, units = "cm", quality = 100)
+
+
+# Records
+bath <- terra::rast("~/Research/mpa_europe/mpaeu_sdm/data/env/terrain/bathymetry_mean.tif")
+
+depths <- terra::extract(bath, st_centroid(europe_h3_shp), ID = F)
+
+depths_df <- data.frame(depth = depths[,1], records = europe_h3_shp$records)
+
+depths_df$bin_depth <- cut(depths_df$depth, 100)
+
+depths_df <- depths_df %>%
+  group_by(bin_depth) %>%
+  summarise(avg_records = mean(records, na.rm = T),
+            min_records = min(records, na.rm = T),
+            max_records = max(records, na.rm = T),
+            depth = mean(depth, na.rm = T))
+
+p2 <- ggplot(depths_df) + 
+  geom_line(aes(x = depth, y = avg_records), linewidth = 1, color = "#009594") +
+  geom_ribbon(aes(ymin = min_records, ymax = max_records, x = depth), alpha = 0.1, fill = "#009594") +
+  scale_y_log10(labels = scales::label_comma()) +
+  theme_light() +
+  xlab("Depth") + ylab("Number of records") + 
+  ggtitle("Average number of records by \nmaximum cell depth", "Shaded area shows minimum and maximum \nnumber of records. Note that y axis is \nlog10 adjusted.") +
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_text(colour = "grey40", size = 14),
+        axis.text = element_text(colour = "grey40", size = 14),
+        plot.subtitle = element_text(colour = "black", size = 16),
+        plot.title = element_text(size = 20)
+        )
+
+p2
+
+layout <- "
+AAABB
+AAABB
+AAABB
+"
+
+(p1 + theme(legend.position = "none")) + p2 + plot_layout(design = layout)
+
+#(p1 + theme(legend.position = "none")) + p2 + plot_layout(widths = c(2, 1))
+
+ggsave(file.path(outfolder, "number_records_sideplot_ea.jpg"),
+       width = 42, height = 18, units = "cm", quality = 100)
